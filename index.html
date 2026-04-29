@@ -89,104 +89,29 @@ def Fexperiment(mean_photon_numbers, k):
     F = np.zeros((len(mean_photon_numbers), k + 1))
     for j1, mu in enumerate(mean_photon_numbers):
         for j2 in range(k + 1):
-            # Protection against factorial overflow
-            prob = np.exp(-mu) * (mu**j2) / math.factorial(j2)
-            F[j1, j2] = prob
-    F[:, -1] = 1.0 - np.sum(F[:, :-1], axis=1)
-    return np.clip(F, 1e-18, 1.0) # Prevent zero elements in Poisson matrix
-
-def logL(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
-    k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
-    
-    # 1. Prediction with a small floor
-    expected = (F @ Pi) * Npulses
-    
-    # 2. Use a safer log calculation
-    # We clip expected to ensure we never take log of 0 or negative numbers
-    log_expected = np.log(np.clip(expected, 1e-15, None))
-    
-    lL = -np.sum(PMeas * log_expected)
-    out = lL / (F.shape[0] * Npulses)
-    
-    # 3. Final safety check: if calculation failed, return high penalty
-    if not np.isfinite(out):
-        return 1e10
-    return out
-
-def diff_P(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
-    k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
-    return np.mean(((PMeas/Npulses) - (F @ Pi))**2)
-
-def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
-    P = np.array(P_list).reshape((-1, n_outcomes))
-    F = Fexperiment(np.array(alpha_list), k)
-    
-    if x0_list is None or len(x0_list) == 0:
-        x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
-    else:
-        x0 = np.array(x0_list)
-        # Sanitize x0 coming back from JS to ensure no NaNs survived
-        x0 = np.nan_to_num(x0, nan=1.0/n_outcomes)
-
-    def constraint(x):
-        Pi = np.reshape(x, (k+1, n_outcomes), order='F')
-        return np.sum(Pi, 1) - 1.0
-
-    # Increase gtol to make the "chunks" more stable
-    res = minimize(logL, x0, args=(P, F, n_outcomes, Npulses),
-                   method='trust-constr', 
-                   options={'maxiter': iters, 'gtol': 1e-4, 'xtol': 1e-4}, 
-                   bounds=[(0,1)]*len(x0), 
-                   constraints={'type': 'eq', 'fun': constraint})
-    
-    mse = diff_P(res.x, P, F, n_outcomes, Npulses)
-    PiOut = np.reshape(res.x, (k + 1, n_outcomes), order='F')
-    expected = (F @ PiOut) * Npulses
-    
-    return {
-        "x": res.x.tolist(), 
-        "expected": expected.flatten().tolist(), 
-        "mse": float(mse)
-    }
-`;
-        
-/*       const pythonCode = `
-import numpy as np
-from scipy.optimize import minimize
-import math
-
-def Fexperiment(mean_photon_numbers, k):
-    F = np.zeros((len(mean_photon_numbers), k + 1))
-    for j1, mu in enumerate(mean_photon_numbers):
-        for j2 in range(k + 1):
             F[j1, j2] = np.exp(-mu) * (mu**j2) / math.factorial(j2)
     F[:, -1] = 1.0 - np.sum(F[:, :-1], axis=1)
-    return F
+    return np.clip(F, 1e-15, 1.0)
 
 def logL(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     k = int(len(Pi_init_flat)/n_outcomes)
     Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     expected = (F @ Pi) * Npulses
-    # Objective per attenuation and per pulse
     lL = -np.sum(PMeas * np.log(expected + 1e-10))
     return lL / (F.shape[0] * Npulses)
 
-def diff_P(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
-    k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
-    return np.mean(((PMeas/Npulses) - (F @ Pi))**2)
-
-def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
+def run_mle_continuous(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_callback):
     P = np.array(P_list).reshape((-1, n_outcomes))
     F = Fexperiment(np.array(alpha_list), k)
-    
-    # Use x0_list if provided, otherwise initialize uniform
-    if x0_list is None or len(x0_list) == 0:
-        x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
-    else:
-        x0 = np.array(x0_list)
+    x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
+
+    def internal_callback(xk, state):
+        # Calculate MSE for the UI
+        Pi = np.reshape(xk, (k+1, n_outcomes), order='F')
+        mse = np.mean(((P/Npulses) - (F @ Pi))**2)
+        # Send data back to JS
+        js_callback(xk.tolist(), float(mse))
+        return False # Continue optimization
 
     def constraint(x):
         Pi = np.reshape(x, (k+1, n_outcomes), order='F')
@@ -194,20 +119,13 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
 
     res = minimize(logL, x0, args=(P, F, n_outcomes, Npulses),
                    method='trust-constr', 
-                   options={'maxiter': iters, 'gtol': 1e-6}, 
+                   options={'maxiter': max_iter, 'verbose': 0}, 
                    bounds=[(0,1)]*len(x0), 
-                   constraints={'type': 'eq', 'fun': constraint})
+                   constraints={'type': 'eq', 'fun': constraint},
+                   callback=internal_callback)
     
-    mse = diff_P(res.x, P, F, n_outcomes, Npulses)
-    PiOut = np.reshape(res.x, (k + 1, n_outcomes), order='F')
-    expected = (F @ PiOut) * Npulses
-    
-    return {
-        "x": res.x.tolist(), 
-        "expected": expected.flatten().tolist(), 
-        "mse": float(mse)
-    }
-`;*/
+    return {"x": res.x.tolist(), "mse": float(res.fun)}
+`;
         document.getElementById('btn-init').onclick = async () => {
             logMsg("Loading Pyodide...");
             pyodide = await loadPyodide();
@@ -263,37 +181,15 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
         document.getElementById('btn-run').onclick = async () => {
         isRunning = true;
         document.getElementById('btn-run').disabled = true;
-        document.getElementById('btn-stop').disabled = false;
         
         const maxN = parseInt(document.getElementById('max-n').value);
         const total = parseInt(document.getElementById('total-iter').value);
-        const step = parseInt(document.getElementById('step-iter').value);
 
-        // Persistent state for this specific run
-        let lastXk = []; 
-
-        for(let i=0; i < total; i += step) {
-            if(!isRunning) break;
-
-            // We pass lastXk back into the Python solver
-            const result = await pyodide.globals.get("run_mle_step")(
-                Array.from(parsedCounts), 
-                Array.from(parsedAlphas), 
-                currentMaxC + 1, 
-                maxN, 
-                extractedNpulses, 
-                step,
-                lastXk 
-            );
-            
-            const resJs = result.toJs();
-            lastXk = resJs.get('x'); // Save the state for the next chunk
-            
-            const flatX = lastXk;
+        // This function is called by Python every iteration
+        const syncUI = (flatX, mse) => {
+            // Update Heatmap
             const n_outcomes = currentMaxC + 1;
             const k_plus_1 = maxN + 1;
-
-            // Heatmap Update (Sync with order='F')
             const z = [];
             for(let c=0; c < n_outcomes; c++) {
                 let row = [];
@@ -303,28 +199,29 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
                 z.push(row);
             }
             
+            // Optimization: Only update the UI every few frames if it feels laggy
             Plotly.restyle('plot-heat', { z: [z] });
-            Plotly.extendTraces('plot-mse', { x: [[i+step]], y: [[resJs.get('mse')]] }, [0]);
+            Plotly.extendTraces('plot-mse', { x: [[iterCounter++]], y: [[mse]] }, [0]);
+        };
 
-            const fitFlat = resJs.get('expected'), fitY = [], fitIdx = [];
-            for(let c=0; c < n_outcomes; c++) {
-                const row = [];
-                for(let a=0; a < parsedAlphas.length; a++) {
-                    row.push(fitFlat[a * n_outcomes + c]);
-                }
-                fitY.push(row); fitIdx.push((c*2)+1);
-            }
-            Plotly.restyle('plot-fit', { y: fitY }, fitIdx);
+        let iterCounter = 0;
+        logMsg("Starting continuous optimization with live callback...");
 
-            logMsg(`Step ${i+step}/${total} | MSE: ${resJs.get('mse').toExponential(3)}`);
-            result.destroy();
-            
-            await new Promise(r => setTimeout(r, 10));
-        }
+        // Run as a single blocking call. 
+        // Note: Pyodide will still block the UI thread, but the callback 
+        // allows us to push data to the GPU/Plotly.
+        await pyodide.globals.get("run_mle_continuous")(
+            Array.from(parsedCounts), 
+            Array.from(parsedAlphas), 
+            currentMaxC + 1, 
+            maxN, 
+            extractedNpulses, 
+            total,
+            syncUI
+        );
 
-        isRunning = false;
+        logMsg("Final MSE reached.");
         document.getElementById('btn-run').disabled = false;
-        document.getElementById('btn-stop').disabled = true;
     };
     </script>
 </body>

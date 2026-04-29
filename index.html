@@ -19,6 +19,7 @@
         button { border: none; padding: 12px; cursor: pointer; border-radius: 4px; font-size: 15px; width: 100%; font-weight: bold; margin-bottom: 10px; }
         #btn-init { background: #0056b3; color: white; }
         #btn-run { background: #28a745; color: white; }
+        #btn-stop { background: #dc3545; color: white; }
         button:disabled { background: #ccc !important; cursor: not-allowed; }
         .log-area { width: 100%; height: 150px; background: #1e1e1e; color: #00ff00; padding: 10px; overflow-y: auto; font-family: monospace; font-size: 12px; margin-top: 10px; border-radius: 4px; }
     </style>
@@ -42,12 +43,19 @@
                 <input type="number" id="max-n" value="20">
             </div>
 
-            <div class="form-group">
-                <label>Max Iterations</label>
-                <input type="number" id="total-iter" value="100">
+            <div style="display: flex; gap: 10px;">
+                <div class="form-group" style="flex:1">
+                    <label>Max Iterations</label>
+                    <input type="number" id="total-iter" value="100">
+                </div>
+                <div class="form-group" style="flex:1">
+                    <label>Update Rate (Steps)</label>
+                    <input type="number" id="update-rate" value="5">
+                </div>
             </div>
 
             <button id="btn-run" disabled>2. Start Continuous MLE</button>
+            <button id="btn-stop" disabled>Stop / Interrupt</button>
             
             <div id="log-output" class="log-area">Ready...</div>
         </div>
@@ -65,6 +73,7 @@
     <script id="worker-code" type="javascript/worker">
         importScripts("https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js");
         let pyodide;
+        let shouldStop = false;
 
         const pythonMLE = `
 import numpy as np
@@ -92,26 +101,28 @@ def diff_P(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     return np.mean(((PMeas/Npulses) - (F @ Pi))**2)
 
-def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_post_message):
+def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, update_rate, js_post_message, check_stop):
     P = np.array(P_list).reshape((-1, n_outcomes))
     F = Fexperiment(np.array(alpha_list), k)
-    
-    # Initialize uniform guess
     x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
 
     def constraint(x):
         Pi = np.reshape(x, (k+1, n_outcomes), order='F')
         return np.sum(Pi, 1) - 1.0
 
-    # The callback fired by trust-constr on every iteration
     def iteration_callback(xk, state):
-        mse = diff_P(xk, P, F, n_outcomes, Npulses)
-        PiOut = np.reshape(xk, (k + 1, n_outcomes), order='F')
-        expected = (F @ PiOut) * Npulses
-        
-        # Send data back to the JavaScript main thread
-        js_post_message(xk.tolist(), expected.flatten().tolist(), float(mse), int(state.nit))
-        return False # Return False to continue optimization
+        # 1. Check if the user clicked Stop in the UI
+        if check_stop():
+            return True # Returning True forces scipy.optimize to terminate early
+            
+        # 2. Only send data back to JS at the specified update rate
+        if int(state.nit) % update_rate == 0:
+            mse = diff_P(xk, P, F, n_outcomes, Npulses)
+            PiOut = np.reshape(xk, (k + 1, n_outcomes), order='F')
+            expected = (F @ PiOut) * Npulses
+            js_post_message(xk.tolist(), expected.flatten().tolist(), float(mse), int(state.nit))
+            
+        return False
 
     res = minimize(logL, x0, args=(P, F, n_outcomes, Npulses),
                    method='trust-constr', 
@@ -119,6 +130,12 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
                    bounds=[(0,1)]*len(x0), 
                    constraints={'type': 'eq', 'fun': constraint},
                    callback=iteration_callback)
+    
+    # Guarantee one final update with the actual converged/stopped result
+    final_mse = diff_P(res.x, P, F, n_outcomes, Npulses)
+    PiOut_final = np.reshape(res.x, (k + 1, n_outcomes), order='F')
+    expected_final = (F @ PiOut_final) * Npulses
+    js_post_message(res.x.tolist(), expected_final.flatten().tolist(), float(final_mse), int(res.nit))
     
     return True
 `;
@@ -133,11 +150,14 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
                 await pyodide.runPythonAsync(pythonMLE);
                 self.postMessage({type: 'ready'});
             } 
-            
+            else if (data.type === 'stop') {
+                shouldStop = true;
+                self.postMessage({type: 'log', msg: 'Stop signal received. Halting solver...'});
+            }
             else if (data.type === 'run') {
-                self.postMessage({type: 'log', msg: 'Starting uninterrupted trust-constr optimization...'});
+                shouldStop = false; // Reset the flag
+                self.postMessage({type: 'log', msg: 'Starting uninterrupted optimization...'});
                 
-                // Expose a JS function to Python for the callback
                 const js_callback = (xk, expected, mse, iterNum) => {
                     self.postMessage({
                         type: 'progress',
@@ -147,10 +167,12 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
                         iteration: iterNum
                     });
                 };
+                
+                const check_stop = () => shouldStop;
 
-                // Run the blocking Python call
                 pyodide.globals.get("run_continuous_mle")(
-                    data.counts, data.alphas, data.maxC + 1, data.maxN, data.npulses, data.iters, js_callback
+                    data.counts, data.alphas, data.maxC + 1, data.maxN, data.npulses, 
+                    data.iters, data.updateRate, js_callback, check_stop
                 );
                 
                 self.postMessage({type: 'done'});
@@ -168,11 +190,9 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
             e.scrollTop = e.scrollHeight;
         };
 
-        // Compile the worker script inline
         const workerBlob = new Blob([document.getElementById('worker-code').textContent], {type: 'application/javascript'});
         worker = new Worker(URL.createObjectURL(workerBlob));
 
-        // Listen for messages from the background thread
         worker.onmessage = function(e) {
             const msg = e.data;
             
@@ -190,6 +210,7 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
             else if (msg.type === 'done') {
                 logMsg("Optimization Complete.");
                 document.getElementById('btn-run').disabled = false;
+                document.getElementById('btn-stop').disabled = true;
             }
         };
 
@@ -212,7 +233,6 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
                 parsedCounts = [];
                 for(let i=0; i<numA*(currentMaxC+1); i++) parsedCounts.push(tokens[idx++]);
                 
-                // Calculate Npulses
                 let firstAlphaSum = 0;
                 for(let c=0; c <= currentMaxC; c++) firstAlphaSum += parsedCounts[c];
                 extractedNpulses = firstAlphaSum;
@@ -237,13 +257,11 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
             Plotly.newPlot('plot-heat', [{ z: [[]], type: 'heatmap' }], { title: 'POVM Heatmap (Order: F)', margin: {t:30} });
         }
 
-        // Extremely fast UI update triggered by the worker's callback
         function updateUI(flatX, fitFlat, mse, iterNum) {
             const maxN = parseInt(document.getElementById('max-n').value);
             const n_outcomes = currentMaxC + 1;
             const k_plus_1 = maxN + 1;
 
-            // Heatmap (Order F)
             const z = [];
             for(let c=0; c < n_outcomes; c++) {
                 let row = [];
@@ -255,7 +273,6 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
             Plotly.restyle('plot-heat', { z: [z] });
             Plotly.extendTraces('plot-mse', { x: [[iterNum]], y: [[mse]] }, [0]);
 
-            // Fit Lines
             const fitY = [], fitIdx = [];
             for(let c=0; c < n_outcomes; c++) {
                 const row = [];
@@ -266,14 +283,18 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
             }
             Plotly.restyle('plot-fit', { y: fitY }, fitIdx);
             
-            // Log update every 5 iterations to avoid spamming the console box
-            if (iterNum % 5 === 0) logMsg(`Iteration ${iterNum} | MSE: ${mse.toExponential(4)}`);
+            logMsg(`Iteration ${iterNum} | MSE: ${mse.toExponential(4)}`);
         }
+
+        document.getElementById('btn-stop').onclick = () => {
+            document.getElementById('btn-stop').disabled = true;
+            worker.postMessage({ type: 'stop' });
+        };
 
         document.getElementById('btn-run').onclick = () => {
             document.getElementById('btn-run').disabled = true;
+            document.getElementById('btn-stop').disabled = false;
             
-            // Send payload to the background worker
             worker.postMessage({
                 type: 'run',
                 counts: Array.from(parsedCounts),
@@ -281,7 +302,8 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
                 maxC: currentMaxC,
                 maxN: parseInt(document.getElementById('max-n').value),
                 npulses: extractedNpulses,
-                iters: parseInt(document.getElementById('total-iter').value)
+                iters: parseInt(document.getElementById('total-iter').value),
+                updateRate: parseInt(document.getElementById('update-rate').value)
             });
         };
     </script>

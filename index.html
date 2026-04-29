@@ -96,12 +96,26 @@ def Fexperiment(mean_photon_numbers, k):
             F[j1, j2] = coherentStateProb(np.sqrt(mu), j2)
     F[:, -1] = 1.0 - np.sum(F[:, :-1], axis=1)
     return F
+def logL(Pi_init_flat, PMeas, F, mean_photon_numbers, n_outcomes, Npulses):
+    lL = 0
+    k = int(len(Pi_init_flat)/n_outcomes)
+    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order = 'F')
+    for s, mean_photon_number in enumerate(mean_photon_numbers):
+        for outcome in range(n_outcomes):
+            F_si = F[s, :]
+            Pi_in = Pi[:, int(outcome)]
+            P_sn = PMeas[s, outcome]
+            lL -= P_sn*np.log(F_si@Pi_in+1e-10)
+    out = lL/len(mean_photon_numbers)/Npulses
+    if np.isnan(out):
+        out = 10000
+    return out
 
-def logL(Pi_flat, PMeas, F, mean_photon_numbers, n_outcomes, Npulses):
-    k = int(len(Pi_flat) / n_outcomes)
-    Pi = np.reshape(Pi_flat, (k, n_outcomes), order='F')
-    expected = (F @ Pi) * Npulses
-    return -np.sum(PMeas * np.log(expected + 1e-10))
+#def logL(Pi_flat, PMeas, F, mean_photon_numbers, n_outcomes, Npulses):
+#    k = int(len(Pi_flat) / n_outcomes)
+#    Pi = np.reshape(Pi_flat, (k, n_outcomes), order='F')
+#    expected = (F @ Pi) * Npulses
+#    return -np.sum(PMeas * np.log(expected + 1e-10))
 
 def diff_P(Pi_flat, PMeas, F, mean_photon_numbers, n_outcomes, Npulses):
     k = int(len(Pi_flat) / n_outcomes)

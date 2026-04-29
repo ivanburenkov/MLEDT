@@ -93,17 +93,23 @@ def Fexperiment(mean_photon_numbers, k):
     F[:, -1] = 1.0 - np.sum(F[:, :-1], axis=1)
     return F
 
-def logL(Pi_init_flat, PMeas, F, mean_photon_numbers, n_outcomes, Npulses):
+def logL(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order = 'F')
+    # Order='F' to match your preferred mapping
+    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     expected = (F @ Pi) * Npulses
+    
+    # Using your specific log-likelihood logic with the 1e-10 protection
+    # Note: args must match exactly (Pi_init_flat, PMeas, F, n_outcomes, Npulses)
     lL = -np.sum(PMeas * np.log(expected + 1e-10))
-    out = lL / len(mean_photon_numbers) / Npulses
+    
+    # Normalizing by number of attenuations and pulses
+    out = lL / F.shape[0] / Npulses
     return 10000.0 if np.isnan(out) else out
 
-def diff_P(Pi_init_flat, PMeas, F, mean_photon_numbers, n_outcomes, Npulses):
+def diff_P(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order = 'F')
+    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     return np.mean(((PMeas/Npulses) - (F @ Pi))**2)
 
 # Global solver state
@@ -114,6 +120,7 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters):
     P = np.array(P_list).reshape((-1, n_outcomes))
     F = Fexperiment(np.array(alpha_list), k)
     
+    # Initialize if first step
     if current_xk is None:
         current_xk = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
 
@@ -121,6 +128,8 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters):
         Pi = np.reshape(x, (k+1, n_outcomes), order='F')
         return np.sum(Pi, 1) - 1.0
 
+    # Synchronization Check: args must have exactly 4 items to satisfy logL(Pi_flat, ...)
+    # 1: P, 2: F, 3: n_outcomes, 4: Npulses
     res = minimize(logL, current_xk, args=(P, F, n_outcomes, Npulses),
                    method='trust-constr', options={'maxiter': iters}, 
                    bounds=[(0,1)]*len(current_xk), 
@@ -143,30 +152,33 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters):
             document.getElementById('data-file').disabled = false;
         };
 
-        document.getElementById('data-file').onchange = (e) => {
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-                const tokens = ev.target.result.trim().split(/\s+/).filter(Boolean).map(Number);
-                let idx = 0;
-                currentMaxC = tokens[idx++];
-                const numA = tokens[idx++];
-                parsedAlphas = [];
-                for(let i=0; i<numA; i++) parsedAlphas.push(tokens[idx++]);
-                
-                parsedCounts = [];
-                for(let i=0; i<numA*(currentMaxC+1); i++) parsedCounts.push(tokens[idx++]);
-                
-                // Npulses calculation: Sum of counts for the first alpha
-                let firstAlphaSum = 0;
-                for(let c=0; c<=currentMaxC; c++) firstAlphaSum += parsedCounts[c];
-                extractedNpulses = firstAlphaSum;
-                
-                logMsg(`Data Loaded. Calculated Npulses: ${extractedNpulses}`);
-                initPlots(currentMaxC, numA);
-                document.getElementById('btn-run').disabled = false;
-            };
-            reader.readAsText(e.target.files[0]);
+       document.getElementById('data-file').onchange = (e) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const tokens = ev.target.result.trim().split(/\s+/).filter(Boolean).map(Number);
+            let idx = 0;
+            currentMaxC = tokens[idx++];
+            const numA = tokens[idx++];
+            
+            parsedAlphas = [];
+            for(let i=0; i<numA; i++) parsedAlphas.push(tokens[idx++]);
+            
+            parsedCounts = [];
+            for(let i=0; i<numA*(currentMaxC+1); i++) parsedCounts.push(tokens[idx++]);
+            
+            // Calculate Npulses as the sum of outcomes for the first attenuation
+            let firstAlphaSum = 0;
+            for(let c=0; c <= currentMaxC; c++) {
+                firstAlphaSum += parsedCounts[c];
+            }
+            extractedNpulses = firstAlphaSum;
+            
+            logMsg(`Calculated Npulses: ${extractedNpulses}`);
+            initPlots(currentMaxC, numA);
+            document.getElementById('btn-run').disabled = false;
         };
+        reader.readAsText(e.target.files[0]);
+    };
 
         function initPlots(maxC, numA) {
             const traces = [];

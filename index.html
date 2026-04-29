@@ -71,14 +71,14 @@
     </div>
 
     <script id="worker-code" type="javascript/worker">
-        importScripts("https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js");
-        let pyodide;
-        let shouldStop = false;
+    importScripts("https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js");
+    let pyodide;
 
-        const pythonMLE = `
+    const pythonMLE = `
 import numpy as np
 from scipy.optimize import minimize
 import math
+import signal
 
 def Fexperiment(mean_photon_numbers, k):
     F = np.zeros((len(mean_photon_numbers), k + 1))
@@ -93,96 +93,84 @@ def logL(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     expected = (F @ Pi) * Npulses
     lL = -np.sum(PMeas * np.log(expected + 1e-10))
-    out = lL / (F.shape[0] * Npulses)
-    return 10000.0 if np.isnan(out) else out
+    return lL / (F.shape[0] * Npulses)
 
 def diff_P(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     k = int(len(Pi_init_flat)/n_outcomes)
     Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     return np.mean(((PMeas/Npulses) - (F @ Pi))**2)
 
-def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, update_rate, js_post_message, check_stop):
+def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, update_rate, js_post_message):
     P = np.array(P_list).reshape((-1, n_outcomes))
     F = Fexperiment(np.array(alpha_list), k)
     x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
+
+    # Current best guess for return on interrupt
+    current_res = {"x": x0}
 
     def constraint(x):
         Pi = np.reshape(x, (k+1, n_outcomes), order='F')
         return np.sum(Pi, 1) - 1.0
 
     def iteration_callback(xk, state):
-        # 1. Check if the user clicked Stop in the UI
-        if check_stop():
-            return True # Returning True forces scipy.optimize to terminate early
-            
-        # 2. Only send data back to JS at the specified update rate
+        current_res["x"] = xk
         if int(state.nit) % update_rate == 0:
             mse = diff_P(xk, P, F, n_outcomes, Npulses)
             PiOut = np.reshape(xk, (k + 1, n_outcomes), order='F')
             expected = (F @ PiOut) * Npulses
             js_post_message(xk.tolist(), expected.flatten().tolist(), float(mse), int(state.nit))
-            
         return False
 
-    res = minimize(logL, x0, args=(P, F, n_outcomes, Npulses),
-                   method='trust-constr', 
-                   options={'maxiter': max_iter, 'verbose': 0}, 
-                   bounds=[(0,1)]*len(x0), 
-                   constraints={'type': 'eq', 'fun': constraint},
-                   callback=iteration_callback)
-    
-    # Guarantee one final update with the actual converged/stopped result
-    final_mse = diff_P(res.x, P, F, n_outcomes, Npulses)
-    PiOut_final = np.reshape(res.x, (k + 1, n_outcomes), order='F')
-    expected_final = (F @ PiOut_final) * Npulses
-    js_post_message(res.x.tolist(), expected_final.flatten().tolist(), float(final_mse), int(res.nit))
-    
+    try:
+        res = minimize(logL, x0, args=(P, F, n_outcomes, Npulses),
+                       method='trust-constr', 
+                       options={'maxiter': max_iter, 'verbose': 0}, 
+                       bounds=[(0,1)]*len(x0), 
+                       constraints={'type': 'eq', 'fun': constraint},
+                       callback=iteration_callback)
+        final_x = res.x
+        final_nit = int(res.nit)
+    except KeyboardInterrupt:
+        # User pressed Stop: extract current state
+        final_x = current_res["x"]
+        final_nit = -1 # Special code for UI to show it was interrupted
+        
+    # Final UI broadcast
+    final_mse = diff_P(final_x, P, F, n_outcomes, Npulses)
+    PiOut_f = np.reshape(final_x, (k + 1, n_outcomes), order='F')
+    expected_f = (F @ PiOut_f) * Npulses
+    js_post_message(final_x.tolist(), expected_f.flatten().tolist(), float(final_mse), final_nit)
     return True
 `;
 
-        self.onmessage = async function(e) {
-            const data = e.data;
-            
-            if (data.type === 'init') {
-                self.postMessage({type: 'log', msg: 'Loading Pyodide & Scipy in background...'});
-                pyodide = await loadPyodide();
-                await pyodide.loadPackage(['numpy', 'scipy']);
-                await pyodide.runPythonAsync(pythonMLE);
-                self.postMessage({type: 'ready'});
-            } 
-            else if (data.type === 'stop') {
-                shouldStop = true;
-                self.postMessage({type: 'log', msg: 'Stop signal received. Halting solver...'});
-            }
-            else if (data.type === 'run') {
-                shouldStop = false; // Reset the flag
-                self.postMessage({type: 'log', msg: 'Starting uninterrupted optimization...'});
-                
-                const js_callback = (xk, expected, mse, iterNum) => {
-                    self.postMessage({
-                        type: 'progress',
-                        xk: xk.toJs(),
-                        expected: expected.toJs(),
-                        mse: mse,
-                        iteration: iterNum
-                    });
-                };
-                
-                const check_stop = () => shouldStop;
+    self.onmessage = async function(e) {
+        const data = e.data;
+        if (data.type === 'init') {
+            pyodide = await loadPyodide();
+            await pyodide.loadPackage(['numpy', 'scipy']);
+            // Set the interrupt buffer (a 1-byte SharedArrayBuffer)
+            pyodide.setInterruptBuffer(data.interruptBuffer);
+            await pyodide.runPythonAsync(pythonMLE);
+            self.postMessage({type: 'ready'});
+        } 
+        else if (data.type === 'run') {
+            const js_callback = (xk, expected, mse, iterNum) => {
+                self.postMessage({ type: 'progress', xk: xk.toJs(), expected: expected.toJs(), mse: mse, iteration: iterNum });
+            };
 
-                pyodide.globals.get("run_continuous_mle")(
-                    data.counts, data.alphas, data.maxC + 1, data.maxN, data.npulses, 
-                    data.iters, data.updateRate, js_callback, check_stop
-                );
-                
-                self.postMessage({type: 'done'});
-            }
-        };
-    </script>
+            pyodide.globals.get("run_continuous_mle")(
+                data.counts, data.alphas, data.maxC + 1, data.maxN, data.npulses, 
+                data.iters, data.updateRate, js_callback
+            );
+            self.postMessage({type: 'done'});
+        }
+    };
+</script>
 
     <script>
         let parsedAlphas, parsedCounts, currentMaxC = 0, extractedNpulses = 1;
         let worker;
+        const interruptBuffer = new Uint8Array(new SharedArrayBuffer(1));
 
         const logMsg = (m) => {
             const e = document.getElementById('log-output');
@@ -214,10 +202,11 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, upd
             }
         };
 
-        document.getElementById('btn-init').onclick = () => {
-            document.getElementById('btn-init').disabled = true;
-            worker.postMessage({ type: 'init' });
-        };
+       document.getElementById('btn-init').onclick = () => {
+                document.getElementById('btn-init').disabled = true;
+                // Pass the buffer to the worker during initialization
+                worker.postMessage({ type: 'init', interruptBuffer: interruptBuffer });
+            };
 
         document.getElementById('data-file').onchange = (e) => {
             const reader = new FileReader();
@@ -284,28 +273,38 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, upd
             Plotly.restyle('plot-fit', { y: fitY }, fitIdx);
             
             logMsg(`Iteration ${iterNum} | MSE: ${mse.toExponential(4)}`);
+            if (iterNum === -1) {
+                logMsg(`HALTED by user. Current MSE: ${mse.toExponential(4)}`);
+            } else {
+                logMsg(`Iteration ${iterNum} | MSE: ${mse.toExponential(4)}`);
+            }
         }
 
         document.getElementById('btn-stop').onclick = () => {
-            document.getElementById('btn-stop').disabled = true;
-            worker.postMessage({ type: 'stop' });
-        };
+                // Write '2' to the buffer (SIGINT signal for Pyodide)
+                interruptBuffer[0] = 2; 
+                logMsg("Interrupt signal sent to solver...");
+                document.getElementById('btn-stop').disabled = true;
+            };
 
         document.getElementById('btn-run').onclick = () => {
-            document.getElementById('btn-run').disabled = true;
-            document.getElementById('btn-stop').disabled = false;
-            
-            worker.postMessage({
-                type: 'run',
-                counts: Array.from(parsedCounts),
-                alphas: Array.from(parsedAlphas),
-                maxC: currentMaxC,
-                maxN: parseInt(document.getElementById('max-n').value),
-                npulses: extractedNpulses,
-                iters: parseInt(document.getElementById('total-iter').value),
-                updateRate: parseInt(document.getElementById('update-rate').value)
-            });
-        };
+                // Reset interrupt buffer before starting
+                interruptBuffer[0] = 0; 
+                
+                document.getElementById('btn-run').disabled = true;
+                document.getElementById('btn-stop').disabled = false;
+                
+                worker.postMessage({
+                    type: 'run',
+                    counts: Array.from(parsedCounts),
+                    alphas: Array.from(parsedAlphas),
+                    maxC: currentMaxC,
+                    maxN: parseInt(document.getElementById('max-n').value),
+                    npulses: extractedNpulses,
+                    iters: parseInt(document.getElementById('total-iter').value),
+                    updateRate: parseInt(document.getElementById('update-rate').value)
+                });
+            };
     </script>
 </body>
 </html>

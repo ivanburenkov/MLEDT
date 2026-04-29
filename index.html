@@ -179,50 +179,50 @@ def run_mle_continuous(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_
         document.getElementById('btn-stop').onclick = () => isRunning = false;
 
         document.getElementById('btn-run').onclick = async () => {
-        isRunning = true;
-        document.getElementById('btn-run').disabled = true;
+                isRunning = true;
+                document.getElementById('btn-run').disabled = true;
+                
+                const maxN = parseInt(document.getElementById('max-n').value);
+                const total = parseInt(document.getElementById('total-iter').value);
         
-        const maxN = parseInt(document.getElementById('max-n').value);
-        const total = parseInt(document.getElementById('total-iter').value);
-
-        // This function is called by Python every iteration
-        const syncUI = (flatX, mse) => {
-            // Update Heatmap
-            const n_outcomes = currentMaxC + 1;
-            const k_plus_1 = maxN + 1;
-            const z = [];
-            for(let c=0; c < n_outcomes; c++) {
-                let row = [];
-                for(let n=0; n < k_plus_1; n++) {
-                    row.push(flatX[c * k_plus_1 + n]);
-                }
-                z.push(row);
-            }
-            
-            // Optimization: Only update the UI every few frames if it feels laggy
-            Plotly.restyle('plot-heat', { z: [z] });
-            Plotly.extendTraces('plot-mse', { x: [[iterCounter++]], y: [[mse]] }, [0]);
-        };
-
-        let iterCounter = 0;
-        logMsg("Starting continuous optimization with live callback...");
-
-        // Run as a single blocking call. 
-        // Note: Pyodide will still block the UI thread, but the callback 
-        // allows us to push data to the GPU/Plotly.
-        await pyodide.globals.get("run_mle_continuous")(
-            Array.from(parsedCounts), 
-            Array.from(parsedAlphas), 
-            currentMaxC + 1, 
-            maxN, 
-            extractedNpulses, 
-            total,
-            syncUI
-        );
-
-        logMsg("Final MSE reached.");
-        document.getElementById('btn-run').disabled = false;
-    };
+                // This function is called by Python every iteration
+                const syncUI = (flatX, mse) => {
+                    // Update Heatmap
+                    const n_outcomes = currentMaxC + 1;
+                    const k_plus_1 = maxN + 1;
+                    const z = [];
+                    for(let c=0; c < n_outcomes; c++) {
+                        let row = [];
+                        for(let n=0; n < k_plus_1; n++) {
+                            row.push(flatX[c * k_plus_1 + n]);
+                        }
+                        z.push(row);
+                    }
+                    
+                    // Optimization: Only update the UI every few frames if it feels laggy
+                    Plotly.restyle('plot-heat', { z: [z] });
+                    Plotly.extendTraces('plot-mse', { x: [[iterCounter++]], y: [[mse]] }, [0]);
+                };
+        
+                let iterCounter = 0;
+                logMsg("Starting continuous optimization with live callback...");
+        
+                // Run as a single blocking call. 
+                // Note: Pyodide will still block the UI thread, but the callback 
+                // allows us to push data to the GPU/Plotly.
+                await pyodide.globals.get("run_mle_continuous")(
+                    Array.from(parsedCounts), 
+                    Array.from(parsedAlphas), 
+                    currentMaxC + 1, 
+                    maxN, 
+                    extractedNpulses, 
+                    total,
+                    syncUI
+                );
+        
+                logMsg("Final MSE reached.");
+                document.getElementById('btn-run').disabled = false;
+            };
     </script>
 </body>
 </html>

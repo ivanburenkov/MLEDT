@@ -3,10 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MLEDT: Trust-Region Iterative Solver</title>
+    <title>MLEDT: Web Worker Continuous Solver</title>
     
     <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js"></script>
 
     <style>
         body { font-family: 'Segoe UI', sans-serif; max-width: 1500px; margin: 0 auto; padding: 20px; color: #333; background-color: #f4f7f6; }
@@ -20,19 +19,18 @@
         button { border: none; padding: 12px; cursor: pointer; border-radius: 4px; font-size: 15px; width: 100%; font-weight: bold; margin-bottom: 10px; }
         #btn-init { background: #0056b3; color: white; }
         #btn-run { background: #28a745; color: white; }
-        #btn-stop { background: #dc3545; color: white; }
         button:disabled { background: #ccc !important; cursor: not-allowed; }
         .log-area { width: 100%; height: 150px; background: #1e1e1e; color: #00ff00; padding: 10px; overflow-y: auto; font-family: monospace; font-size: 12px; margin-top: 10px; border-radius: 4px; }
     </style>
 </head>
 <body>
 
-    <h1>MLE Detector Tomography (Trust-Region)</h1>
+    <h1>MLE Detector Tomography (Web Worker)</h1>
 
     <div class="dashboard">
         <div class="panel">
             <h3>Controls</h3>
-            <button id="btn-init">1. Initialize Engine</button>
+            <button id="btn-init">1. Initialize Background Engine</button>
             
             <div class="form-group">
                 <label>Experimental Data File</label>
@@ -44,19 +42,12 @@
                 <input type="number" id="max-n" value="20">
             </div>
 
-            <div style="display: flex; gap: 10px;">
-                <div class="form-group" style="flex:1">
-                    <label>Total Iterations</label>
-                    <input type="number" id="total-iter" value="100">
-                </div>
-                <div class="form-group" style="flex:1">
-                    <label>Step Size</label>
-                    <input type="number" id="step-iter" value="5">
-                </div>
+            <div class="form-group">
+                <label>Max Iterations</label>
+                <input type="number" id="total-iter" value="100">
             </div>
 
-            <button id="btn-run" disabled>2. Start Solver</button>
-            <button id="btn-stop" disabled>Stop</button>
+            <button id="btn-run" disabled>2. Start Continuous MLE</button>
             
             <div id="log-output" class="log-area">Ready...</div>
         </div>
@@ -71,16 +62,11 @@
         </div>
     </div>
 
-    <script>
-        let pyodide, parsedAlphas, parsedCounts, isRunning = false, currentMaxC = 0, extractedNpulses = 1;
+    <script id="worker-code" type="javascript/worker">
+        importScripts("https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js");
+        let pyodide;
 
-        const logMsg = (m) => {
-            const e = document.getElementById('log-output');
-            e.innerText += `\n[${new Date().toLocaleTimeString()}] ${m}`;
-            e.scrollTop = e.scrollHeight;
-        };
-
-        const pythonCode = `
+        const pythonMLE = `
 import numpy as np
 from scipy.optimize import minimize
 import math
@@ -95,80 +81,148 @@ def Fexperiment(mean_photon_numbers, k):
 
 def logL(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order = 'F')
+    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     expected = (F @ Pi) * Npulses
-    # Objective per attenuation and per pulse
     lL = -np.sum(PMeas * np.log(expected + 1e-10))
-    out = lL / len(PMeas) / Npulses
+    out = lL / (F.shape[0] * Npulses)
     return 10000.0 if np.isnan(out) else out
 
 def diff_P(Pi_init_flat, PMeas, F, n_outcomes, Npulses):
     k = int(len(Pi_init_flat)/n_outcomes)
-    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order = 'F')
+    Pi = np.reshape(Pi_init_flat, (k, n_outcomes), order='F')
     return np.mean(((PMeas/Npulses) - (F @ Pi))**2)
 
-def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
+def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, js_post_message):
     P = np.array(P_list).reshape((-1, n_outcomes))
     F = Fexperiment(np.array(alpha_list), k)
     
-    if x0_list is None or len(x0_list) == 0:
-        x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
-    else:
-        x0 = np.array(x0_list)
+    # Initialize uniform guess
+    x0 = (np.ones((k + 1, n_outcomes)) / n_outcomes).flatten(order='F')
 
     def constraint(x):
         Pi = np.reshape(x, (k+1, n_outcomes), order='F')
         return np.sum(Pi, 1) - 1.0
 
-    # Note: Using a slightly higher gtol to keep chunks moving
+    # The callback fired by trust-constr on every iteration
+    def iteration_callback(xk, state):
+        mse = diff_P(xk, P, F, n_outcomes, Npulses)
+        PiOut = np.reshape(xk, (k + 1, n_outcomes), order='F')
+        expected = (F @ PiOut) * Npulses
+        
+        # Send data back to the JavaScript main thread
+        js_post_message(xk.tolist(), expected.flatten().tolist(), float(mse), int(state.nit))
+        return False # Return False to continue optimization
+
     res = minimize(logL, x0, args=(P, F, n_outcomes, Npulses),
                    method='trust-constr', 
-                   options={'maxiter': iters, 'gtol': 1e-6}, 
+                   options={'maxiter': max_iter, 'verbose': 0}, 
                    bounds=[(0,1)]*len(x0), 
-                   constraints={'type': 'eq', 'fun': constraint})
+                   constraints={'type': 'eq', 'fun': constraint},
+                   callback=iteration_callback)
     
-    mse = diff_P(res.x, P, F, n_outcomes, Npulses)
-    PiOut = np.reshape(res.x, (k + 1, n_outcomes), order='F')
-    expected = (F @ PiOut) * Npulses
-    
-    return {"x": res.x.tolist(), "expected": expected.flatten().tolist(), "mse": float(mse)}
+    return True
 `;
-        document.getElementById('btn-init').onclick = async () => {
-            logMsg("Loading Pyodide...");
-            pyodide = await loadPyodide();
-            await pyodide.loadPackage(['numpy', 'scipy']);
-            await pyodide.runPythonAsync(pythonCode);
-            logMsg("Engine Ready.");
-            document.getElementById('data-file').disabled = false;
+
+        self.onmessage = async function(e) {
+            const data = e.data;
+            
+            if (data.type === 'init') {
+                self.postMessage({type: 'log', msg: 'Loading Pyodide & Scipy in background...'});
+                pyodide = await loadPyodide();
+                await pyodide.loadPackage(['numpy', 'scipy']);
+                await pyodide.runPythonAsync(pythonMLE);
+                self.postMessage({type: 'ready'});
+            } 
+            
+            else if (data.type === 'run') {
+                self.postMessage({type: 'log', msg: 'Starting uninterrupted trust-constr optimization...'});
+                
+                // Expose a JS function to Python for the callback
+                const js_callback = (xk, expected, mse, iterNum) => {
+                    self.postMessage({
+                        type: 'progress',
+                        xk: xk.toJs(),
+                        expected: expected.toJs(),
+                        mse: mse,
+                        iteration: iterNum
+                    });
+                };
+
+                // Run the blocking Python call
+                pyodide.globals.get("run_continuous_mle")(
+                    data.counts, data.alphas, data.maxC + 1, data.maxN, data.npulses, data.iters, js_callback
+                );
+                
+                self.postMessage({type: 'done'});
+            }
+        };
+    </script>
+
+    <script>
+        let parsedAlphas, parsedCounts, currentMaxC = 0, extractedNpulses = 1;
+        let worker;
+
+        const logMsg = (m) => {
+            const e = document.getElementById('log-output');
+            e.innerText += `\n[${new Date().toLocaleTimeString()}] ${m}`;
+            e.scrollTop = e.scrollHeight;
         };
 
-       document.getElementById('data-file').onchange = (e) => {
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-            const tokens = ev.target.result.trim().split(/\s+/).filter(Boolean).map(Number);
-            let idx = 0;
-            currentMaxC = tokens[idx++];
-            const numA = tokens[idx++];
+        // Compile the worker script inline
+        const workerBlob = new Blob([document.getElementById('worker-code').textContent], {type: 'application/javascript'});
+        worker = new Worker(URL.createObjectURL(workerBlob));
+
+        // Listen for messages from the background thread
+        worker.onmessage = function(e) {
+            const msg = e.data;
             
-            parsedAlphas = [];
-            for(let i=0; i<numA; i++) parsedAlphas.push(tokens[idx++]);
-            
-            parsedCounts = [];
-            for(let i=0; i<numA*(currentMaxC+1); i++) parsedCounts.push(tokens[idx++]);
-            
-            // Calculate Npulses as the sum of outcomes for the first attenuation
-            let firstAlphaSum = 0;
-            for(let c=0; c <= currentMaxC; c++) {
-                firstAlphaSum += parsedCounts[c];
+            if (msg.type === 'log') {
+                logMsg(msg.msg);
+            } 
+            else if (msg.type === 'ready') {
+                logMsg("Background Engine Ready.");
+                document.getElementById('btn-init').disabled = true;
+                document.getElementById('data-file').disabled = false;
+            } 
+            else if (msg.type === 'progress') {
+                updateUI(msg.xk, msg.expected, msg.mse, msg.iteration);
+            } 
+            else if (msg.type === 'done') {
+                logMsg("Optimization Complete.");
+                document.getElementById('btn-run').disabled = false;
             }
-            extractedNpulses = firstAlphaSum;
-            
-            logMsg(`Calculated Npulses: ${extractedNpulses}`);
-            initPlots(currentMaxC, numA);
-            document.getElementById('btn-run').disabled = false;
         };
-        reader.readAsText(e.target.files[0]);
-    };
+
+        document.getElementById('btn-init').onclick = () => {
+            document.getElementById('btn-init').disabled = true;
+            worker.postMessage({ type: 'init' });
+        };
+
+        document.getElementById('data-file').onchange = (e) => {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const tokens = ev.target.result.trim().split(/\s+/).filter(Boolean).map(Number);
+                let idx = 0;
+                currentMaxC = tokens[idx++];
+                const numA = tokens[idx++];
+                
+                parsedAlphas = [];
+                for(let i=0; i<numA; i++) parsedAlphas.push(tokens[idx++]);
+                
+                parsedCounts = [];
+                for(let i=0; i<numA*(currentMaxC+1); i++) parsedCounts.push(tokens[idx++]);
+                
+                // Calculate Npulses
+                let firstAlphaSum = 0;
+                for(let c=0; c <= currentMaxC; c++) firstAlphaSum += parsedCounts[c];
+                extractedNpulses = firstAlphaSum;
+                
+                logMsg(`Data Loaded. Calculated Npulses: ${extractedNpulses}`);
+                initPlots(currentMaxC, numA);
+                document.getElementById('btn-run').disabled = false;
+            };
+            reader.readAsText(e.target.files[0]);
+        };
 
         function initPlots(maxC, numA) {
             const traces = [];
@@ -178,82 +232,58 @@ def run_mle_step(P_list, alpha_list, n_outcomes, k, Npulses, iters, x0_list):
                 traces.push({ x: parsedAlphas, y: y, mode: 'markers', name: `Exp c=${c}` });
                 traces.push({ x: parsedAlphas, y: new Array(numA).fill(0), mode: 'lines', name: `Fit c=${c}`, line: {dash:'dot'} });
             }
-            Plotly.newPlot('plot-fit', traces, { title: 'Fit Accuracy' });
-            Plotly.newPlot('plot-mse', [{ x: [], y: [], mode: 'lines+markers', name: 'MSE' }], { title: 'Log-MSE Convergence', yaxis: {type:'log'} });
-            Plotly.newPlot('plot-heat', [{ z: [[]], type: 'heatmap' }], { title: 'POVM Heatmap (Order: F)' });
+            Plotly.newPlot('plot-fit', traces, { title: 'Fit Accuracy', margin: {t:30} });
+            Plotly.newPlot('plot-mse', [{ x: [], y: [], mode: 'lines+markers', name: 'MSE' }], { title: 'Log-MSE Convergence', yaxis: {type:'log'}, margin: {t:30} });
+            Plotly.newPlot('plot-heat', [{ z: [[]], type: 'heatmap' }], { title: 'POVM Heatmap (Order: F)', margin: {t:30} });
         }
 
-        document.getElementById('btn-stop').onclick = () => isRunning = false;
+        // Extremely fast UI update triggered by the worker's callback
+        function updateUI(flatX, fitFlat, mse, iterNum) {
+            const maxN = parseInt(document.getElementById('max-n').value);
+            const n_outcomes = currentMaxC + 1;
+            const k_plus_1 = maxN + 1;
 
-        document.getElementById('btn-run').onclick = async () => {
-                isRunning = true;
-                document.getElementById('btn-run').disabled = true;
-                document.getElementById('btn-stop').disabled = false;
-                
-                const maxN = parseInt(document.getElementById('max-n').value);
-                const total = parseInt(document.getElementById('total-iter').value);
-                // Larger step size (e.g. 25) allows trust-constr to 'warm up' and converge 
-                // while still giving the UI 4 updates over a 100-step run.
-                const step = 25; 
-        
-                let lastXk = []; 
-        
-                for(let i=0; i < total; i += step) {
-                    if(!isRunning) break;
-        
-                    // Execute the Python chunk
-                    const result = await pyodide.globals.get("run_mle_step")(
-                        Array.from(parsedCounts), 
-                        Array.from(parsedAlphas), 
-                        currentMaxC + 1, 
-                        maxN, 
-                        extractedNpulses, 
-                        step,
-                        lastXk 
-                    );
-                    
-                    const resJs = result.toJs();
-                    lastXk = resJs.get('x');
-                    
-                    // Reconstruct matrix for Plotly (Order: F)
-                    const n_outcomes = currentMaxC + 1;
-                    const k_plus_1 = maxN + 1;
-                    const z = [];
-                    for(let c=0; c < n_outcomes; c++) {
-                        let row = [];
-                        for(let n=0; n < k_plus_1; n++) {
-                            row.push(lastXk[c * k_plus_1 + n]);
-                        }
-                        z.push(row);
-                    }
-        
-                    // Update UI
-                    Plotly.restyle('plot-heat', { z: [z] });
-                    Plotly.extendTraces('plot-mse', { x: [[i+step]], y: [[resJs.get('mse')]] }, [0]);
-        
-                    // Update Fit Lines
-                    const fitFlat = resJs.get('expected'), fitY = [], fitIdx = [];
-                    for(let c=0; c < n_outcomes; c++) {
-                        const row = [];
-                        for(let a=0; a < parsedAlphas.length; a++) {
-                            row.push(fitFlat[a * n_outcomes + c]);
-                        }
-                        fitY.push(row); fitIdx.push((c*2)+1);
-                    }
-                    Plotly.restyle('plot-fit', { y: fitY }, fitIdx);
-        
-                    logMsg(`Progress: ${Math.round((i+step)/total*100)}% | MSE: ${resJs.get('mse').toExponential(4)}`);
-                    result.destroy();
-        
-                    // CRITICAL: This allows the browser to actually paint the Plotly changes 
-                    // and keep the UI responsive.
-                    await new Promise(r => setTimeout(r, 50));
+            // Heatmap (Order F)
+            const z = [];
+            for(let c=0; c < n_outcomes; c++) {
+                let row = [];
+                for(let n=0; n < k_plus_1; n++) {
+                    row.push(flatX[c * k_plus_1 + n]);
                 }
-        
-                isRunning = false;
-                document.getElementById('btn-run').disabled = false;
-                document.getElementById('btn-stop').disabled = true;
-            };
+                z.push(row);
+            }
+            Plotly.restyle('plot-heat', { z: [z] });
+            Plotly.extendTraces('plot-mse', { x: [[iterNum]], y: [[mse]] }, [0]);
+
+            // Fit Lines
+            const fitY = [], fitIdx = [];
+            for(let c=0; c < n_outcomes; c++) {
+                const row = [];
+                for(let a=0; a < parsedAlphas.length; a++) {
+                    row.push(fitFlat[a * n_outcomes + c]);
+                }
+                fitY.push(row); fitIdx.push((c*2)+1);
+            }
+            Plotly.restyle('plot-fit', { y: fitY }, fitIdx);
+            
+            // Log update every 5 iterations to avoid spamming the console box
+            if (iterNum % 5 === 0) logMsg(`Iteration ${iterNum} | MSE: ${mse.toExponential(4)}`);
+        }
+
+        document.getElementById('btn-run').onclick = () => {
+            document.getElementById('btn-run').disabled = true;
+            
+            // Send payload to the background worker
+            worker.postMessage({
+                type: 'run',
+                counts: Array.from(parsedCounts),
+                alphas: Array.from(parsedAlphas),
+                maxC: currentMaxC,
+                maxN: parseInt(document.getElementById('max-n').value),
+                npulses: extractedNpulses,
+                iters: parseInt(document.getElementById('total-iter').value)
+            });
+        };
     </script>
 </body>
 </html>

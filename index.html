@@ -192,6 +192,8 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, upd
     </script>
 
     <script>
+        let mseHistory = [];
+        let iterHistory = [];
         let parsedAlphas, parsedCounts, currentMaxC = 0, extractedNpulses = 1;
         let worker;
 
@@ -279,6 +281,8 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, upd
                 z.push(row);
             }
             Plotly.restyle('plot-heat', { z: [z] });
+            mseHistory.push(mse);
+            iterHistory.push(iterNum);
             Plotly.extendTraces('plot-mse', { x: [[iterNum]], y: [[mse]] }, [0]);
 
             const fitY = [], fitIdx = [];
@@ -301,6 +305,8 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, upd
         };
 
         document.getElementById('btn-run').onclick = () => {
+            mseHistory = [];
+            iterHistory = [];
             document.getElementById('btn-run').disabled = true;
             document.getElementById('btn-stop').disabled = false;
             worker.postMessage({

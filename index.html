@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MLEDT: Continuous Solver</title>
+    <title>Detector Tomography: MLE</title>
     
     <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 
@@ -27,7 +27,7 @@
 </head>
 <body>
 
-    <h1>Maximum Likelihood Estimation: Detector Tomography</h1>
+    <h1>Detector Tomography: MLE</h1>
 
     <div class="dashboard">
         <div class="panel">
@@ -39,7 +39,7 @@
             </div>
 
             <div class="form-group">
-                <label>Max Photons in Model (N)</label>
+                <label>Max input photons (N)</label>
                 <input type="number" id="max-n" value="20">
             </div>
 
@@ -49,13 +49,13 @@
                     <input type="number" id="total-iter" value="100">
                 </div>
                 <div class="form-group" style="flex:1">
-                    <label>Update Rate (Steps)</label>
+                    <label>Results update period (iterations)</label>
                     <input type="number" id="update-rate" value="5">
                 </div>
             </div>
 
             <div class="btn-group">
-                <button id="btn-init">1. Initialize Engine</button>
+                <button id="btn-init">1. Initialize Python</button>
                 <button id="btn-run" disabled>2. Start Calculation</button>
                 <button id="btn-stop" disabled>Stop / Reset</button>
             </div>

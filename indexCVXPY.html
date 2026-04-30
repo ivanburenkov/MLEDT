@@ -89,12 +89,12 @@
     </div>
 
     <script id="worker-code" type="javascript/worker">
-        importScripts("https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js");
+        importScripts("https://cdn.jsdelivr.net/pyodide/v0.28.0/full/pyodide.js");
         let pyodide;
 
         const pythonMLE = `
 import numpy as np
-import cvxpy as cp
+import cvxpy-base as cp
 import math
 
 def f_experiment(mean_photon_numbers, k):
@@ -125,7 +125,7 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k_plus_1, n_pulses, max_i
     
     # run optimization (CVXPY does not support iteration callbacks natively)
     try:
-        logLikelihood = maxLLProb.solve(verbose=False, max_iters=max_iter)
+        logLikelihood = maxLLProb.solve(solver=cp.CLARABEL, canon_backend='SCIPY', verbose=False, max_iters=max_iter)
     except Exception as e:
         # Fallback if the default solver complains about kwargs
         logLikelihood = maxLLProb.solve(verbose=False)
@@ -151,21 +151,21 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k_plus_1, n_pulses, max_i
                 self.postMessage({type: 'log', msg: 'Waking up Python engine (Loading CVXPY)...'});
                 pyodide = await loadPyodide();
 
-                pyodide = await loadPyodide();
+                //pyodide = await loadPyodide();
                 // Load micropip alongside your built-in packages
-                await pyodide.loadPackage(['micropip', 'numpy', 'scipy']);
+                //await pyodide.loadPackage(['micropip', 'numpy', 'scipy']);
                 
                 // Use micropip to install cvxpy dynamically
-                const micropip = pyodide.pyimport("micropip");
-                self.postMessage({type: 'log', msg: 'Downloading cvxpy via micropip...'});
-                await micropip.install("cvxpy");
+                //const micropip = pyodide.pyimport("micropip");
+                //self.postMessage({type: 'log', msg: 'Downloading cvxpy via micropip...'});
+                //await micropip.install("cvxpy");
                 
-                await pyodide.runPythonAsync(pythonMLE);
-                self.postMessage({type: 'ready'});
-        
-                //await pyodide.loadPackage(['numpy', 'scipy', 'cvxpy']);
                 //await pyodide.runPythonAsync(pythonMLE);
                 //self.postMessage({type: 'ready'});
+        
+                await pyodide.loadPackage(['numpy', 'scipy', 'cvxpy-base']);
+                await pyodide.runPythonAsync(pythonMLE);
+                self.postMessage({type: 'ready'});
             } 
             else if (data.type === 'run') {
                 self.postMessage({type: 'log', msg: 'Handing problem to CVXPY (UI will freeze until solved)...'});

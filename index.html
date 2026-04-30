@@ -307,6 +307,17 @@ def run_continuous_mle(P_list, alpha_list, n_outcomes, k, Npulses, max_iter, upd
         document.getElementById('btn-run').onclick = () => {
             mseHistory = [];
             iterHistory = [];
+            Plotly.react('plot-mse', [{
+                x: iterHistory,
+                y: mseHistory,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: 'MSE'
+            }], {
+                title: 'Convergence (MSE)',
+                xaxis: { title: 'Iteration' },
+                yaxis: { title: 'MSE', type: 'log' } // log scale is usually better for MSE
+            });
             document.getElementById('btn-run').disabled = true;
             document.getElementById('btn-stop').disabled = false;
             worker.postMessage({
